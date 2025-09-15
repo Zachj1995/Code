@@ -1,17 +1,24 @@
 /************************************************************
  * HiBob ↔ Gusto Comparison Generator (Yes/No version)
- * Fixes:
- *  - Filter out Gusto employees terminated in previous calendar years
- *  - Define and use type_b (mapped from FLSA) for Type/Amount comparisons
- *  - Align headers/values (Type_Bob)
- *  - Robust Gusto effective-date (range) parsing
- *  - Standardize US_Filter_Reason values
- *  - Better ambiguity handling and notes coverage
+ *
+ * Recreated & fixed: single-file Google Apps Script.
+ *
+ * Key fixes and improvements:
+ *  - Sheet-aware header mapping to avoid cross-sheet alias collisions.
+ *  - Robust fallback lookups for Bob FLSA and Gusto employee type so Type_Bob
+ *    comes from Bob's FLSA and Type_Gusto is populated from Gusto.
+ *  - Safer date comparisons (use Date objects).
+ *  - More tolerant comp-rate parser (additional 'per' variants and explicit ISO codes).
+ *  - Canonical type constants to avoid accidental mismatches by case/whitespace.
+ *  - Small readability & defensive checks.
  ************************************************************/
 
 const SHEET_BOB = 'Bob';
 const SHEET_GUSTO = 'Gusto';
 const SHEET_COMPARISON = 'Comparison';
+
+const TYPE_SALARY = 'Salary/No overtime';
+const TYPE_HOURLY = 'Paid by the hour';
 
 const HEADER_ALIASES = {
   // shared
@@ -23,26 +30,26 @@ const HEADER_ALIASES = {
   // address
   address: ['full address', 'address', 'street address', 'home address', 'home street address'],
 
-  // hibob
+  // hibob (Bob)
   lifecycleStatus: ['lifecycle status', 'employment lifecycle status', 'status (hibob)'],
   lastDayOfWork: ['last day of work', 'termination date', 'last working day', 'employment end date'],
-  flsaCode: ['flsa code', 'flsa', 'flsa status'],
+  flsaCode: ['flsa code', 'flsa', 'flsa status', 'flsa_code'],
   baseSalary: ['base salary', 'salary', 'base pay', 'annual base salary'],
-  baseCurrency: ['base salary currency', 'currency', 'salary currency'],
+  baseCurrency: ['base salary currency', 'currency', 'salary currency', 'currency code'],
   payFrequency: ['salary pay frequency', 'salary pay period', 'pay frequency', 'pay period'],
   effDate: ['base salary/effective date', 'base salary effective date', 'effective date'],
 
   // gusto
   employmentStatus: ['employment status', 'status', 'employee status'],
-  employeeType: ['employee type', 'job compensation type'],
+  employeeType: ['employee type', 'job compensation type', 'employee_type'],
   endDate: ['employee end date', 'end date'],
-  compRateString: ['job compensation rate', 'compensation rate', 'rate'],
-  compEffectiveDate: ['job compensation effective date', 'compensation effective date']
+  compRateString: ['job compensation rate', 'compensation rate', 'rate', 'comp rate'],
+  compEffectiveDate: ['job compensation effective date', 'compensation effective date', 'comp effective date']
 };
 
 const FLSA_TO_GUSTO = {
-  'exempt': 'Salary/No overtime',
-  'non-exempt': 'Paid by the hour'
+  'exempt': TYPE_SALARY,
+  'non-exempt': TYPE_HOURLY
 };
 
 const US_TOKENS = ['united states', 'usa', 'u.s.', 'us', 'united states of america'];
@@ -130,14 +137,14 @@ function readSheetRecords_(ss, sheetName) {
   const values = sh.getDataRange().getValues();
   if (!values.length) return { headers: [], records: [] };
 
-  // find header row
+  // find header row (first row with >=2 non-empty cells)
   let headerRowIdx = 0;
   for (let i = 0; i < values.length; i++) {
     const nonEmpty = values[i].filter(v => String(v).trim() !== '').length;
     if (nonEmpty >= 2) { headerRowIdx = i; break; }
   }
   const rawHeaders = values[headerRowIdx].map(h => String(h || '').trim());
-  const map = buildHeaderMap_(rawHeaders);
+  const map = buildHeaderMap_(rawHeaders, sheetName);
 
   const records = [];
   for (let r = headerRowIdx + 1; r < values.length; r++) {
@@ -155,19 +162,35 @@ function readSheetRecords_(ss, sheetName) {
   return { headers: rawHeaders, records };
 }
 
-function buildHeaderMap_(headers) {
+/**
+ * buildHeaderMap_ - map raw header strings to canonical keys, with sheet-scoped filtering
+ */
+function buildHeaderMap_(headers, sheetName) {
   const lower = headers.map(h => h.toString().trim().toLowerCase());
   const map = new Array(headers.length).fill(null);
+
+  // keys that are Bob-specific vs Gusto-specific; shared keys are handled too.
+  const bobKeys = new Set(['lifecycleStatus','lastDayOfWork','flsaCode','baseSalary','baseCurrency','payFrequency','effDate']);
+  const gustoKeys = new Set(['employmentStatus','employeeType','endDate','compRateString','compEffectiveDate']);
+  const sharedKeys = new Set(['email','firstName','lastName','dob','address']);
+
   for (let c = 0; c < lower.length; c++) {
     const h = lower[c];
     for (const [canon, aliases] of Object.entries(HEADER_ALIASES)) {
+      // restrict candidates based on sheet
+      if (sheetName === SHEET_BOB && !(bobKeys.has(canon) || sharedKeys.has(canon))) continue;
+      if (sheetName === SHEET_GUSTO && !(gustoKeys.has(canon) || sharedKeys.has(canon))) continue;
+      // allow mapping if alias matches
       if (aliases.some(a => h === a)) { map[c] = canon; break; }
       const hLoose = h.replace(/[()]/g, '').trim();
-      if (!map[c] && aliases.some(a => hLoose === a)) map[c] = canon;
+      if (!map[c] && aliases.some(a => hLoose === a)) { map[c] = canon; break; }
     }
+
+    // generic fallbacks (if still unmapped)
     if (!map[c]) {
       if (h === 'status') map[c] = 'employmentStatus';
       if (h === 'currency code') map[c] = 'baseCurrency';
+      // allow "employee type" on Bob sheets only if explicitly present in alias list
     }
   }
   return map;
@@ -188,7 +211,7 @@ function normalizeRecord_(obj) {
 
   if (out.effDate) out.effDate = normalizeDateString_(out.effDate);
   if (out.compEffectiveDate) {
-    // Split only on range separator with spaces or long dashes, not on date hyphens
+    // Split only on range separator with surrounding spaces or long dashes, not on date hyphens
     const start = String(out.compEffectiveDate).split(/\s[-–—]\s/)[0].trim();
     out.compEffectiveDate = normalizeDateString_(start);
   }
@@ -353,9 +376,14 @@ function comparePairYesNo_(b, g, meta) {
   const term_b = b ? (b.lastDayOfWork || '') : '';
   const term_g = g ? (g.endDate || '') : '';
 
-  const flsa_b = b ? normalizeFLSA_(b.flsaCode) : ''; // "Exempt" | "Non-Exempt" | ""
-  const type_b = flsa_b ? flsaToType_(flsa_b) : '';    // mapped: "Salary/No overtime" | "Paid by the hour" | ""
-  const type_g = g ? normalizeGustoType_(g.employeeType) : '';
+  // Robust Bob FLSA lookup (accept many incoming header variants)
+  const rawFlsaBob = b ? (b.flsaCode || b.flsa || b.flsa_status || b.flsa_code || '') : '';
+  const flsa_b = rawFlsaBob ? normalizeFLSA_(rawFlsaBob) : ''; // "Exempt" | "Non-Exempt" | ""
+  const type_b = flsa_b ? flsaToType_(flsa_b) : '';    // mapped: TYPE_SALARY | TYPE_HOURLY | ""
+
+  // Robust Gusto type lookup
+  const rawGustoType = g ? (g.employeeType || g.employee_type || g['job compensation type'] || g.jobCompensationType || '') : '';
+  const type_g = rawGustoType ? normalizeGustoType_(rawGustoType) : '';
 
   const amt_b = b ? (isNumber_(b.baseSalary) ? b.baseSalary : null) : null;
   const amt_g = g ? (isNumber_(g.compAmount) ? g.compAmount : null) : null;
@@ -462,6 +490,249 @@ function normalizeFLSA_(s) {
   return '';
 }
 
+function flsaToType_(flsa) {
+  if (!flsa) return '';
+  const low = String(flsa).toLowerCase();
+  if (low.includes('non') && low.includes('exempt')) return FLSA_TO_GUSTO['non-exempt'];
+  if (low.includes('exempt')) return FLSA_TO_GUSTO['exempt'];
+  return '';
+}
+
+function normalizeGustoType_(t) {
+  if (!t) return '';
+  const low = String(t).toLowerCase();
+  if (low.includes('no overtime')) return TYPE_SALARY;
+  if (low.includes('paid by the hour') || low.includes('hour')) return TYPE_HOURLY;
+  // fallback: try to map common words
+  if (low.includes('salary') && !low.includes('hour')) return TYPE_SALARY;
+  if (low.includes('hour') && !low.includes('salary')) return TYPE_HOURLY;
+  return String(t).trim(); // keep trimmed original as last resort
+}
+
+function typePeriodConsistent_(type_g, period_g) {
+  const t = (type_g || '').toLowerCase();
+  const p = (period_g || '').toLowerCase();
+  if (!t) return true; // if no type, don't block on consistency here
+  if (t.includes('salary')) return (p === 'year' || p === 'month' || p === '');
+  if (t.includes('hour')) return (p === 'hour' || p === '');
+  return true;
+}
+
+function canCompareAmounts_(type_b, type_g, freq_b, period_g) {
+  const tB = (type_b || '').toLowerCase();
+  const tG = (type_g || '').toLowerCase();
+  const fB = (freq_b || '').toLowerCase();
+  const pG = (period_g || '').toLowerCase();
+
+  // Only compare when units align without conversion.
+  if (tB.includes('salary') && tG.includes('salary')) {
+    if (pG === 'year') return (fB === '' || fB === 'year');   // assume Bob is annual if blank
+    if (pG === 'month') return (fB === 'month');
+    return false;
+  }
+  if (tB.includes('hour') && tG.includes('hour')) {
+    return (pG === 'hour');
+  }
+  return false;
+}
+
+function normalizeFrequency_(f) {
+  if (!f) return '';
+  const low = String(f).toLowerCase().trim();
+  return FREQ_MAP[low] || low;
+}
+
+function parseCompRate_(s) {
+  // Handles many common forms:
+  // "$214,200.00 / year", "$55 / hour", "£30 per hour", "214200 per year USD", "55pa"
+  const out = { amount: null, period: null, currency: 'USD' };
+  if (!s) return out;
+  const str = String(s).trim();
+
+  // try to match with symbols and many "per" variants
+  const m = str.match(/([\$£€])?\s*([\d,]+(?:\.\d+)?)\s*(?:\/|\bper\b|\bat\b|\bpa\b|\bp\.a\.?\b)\s*(year|annual|annum|month|monthly|week|weekly|hour|hourly)/i);
+  if (m) {
+    const symbol = m[1] || '$';
+    const amt = parseFloat(m[2].replace(/,/g, ''));
+    const per = m[3].toLowerCase();
+    out.amount = isNaN(amt) ? null : amt;
+    out.period = FREQ_MAP[per] || per;
+    out.currency = symbolToISO_(symbol);
+  } else {
+    // try to find numeric and a period word somewhere
+    const mm = str.match(/([\d,]+(?:\.\d+)?)/);
+    if (mm) {
+      const amt = parseFloat(mm[1].replace(/,/g, ''));
+      out.amount = isNaN(amt) ? null : amt;
+    }
+    const perMatch = str.match(/\b(year|annual|annum|month|monthly|week|weekly|hour|hourly|pa)\b/i);
+    if (perMatch) out.period = FREQ_MAP[perMatch[1].toLowerCase()] || perMatch[1].toLowerCase();
+    const codeMatch = str.match(/\b(USD|GBP|EUR)\b/i);
+    if (codeMatch) out.currency = codeMatch[1].toUpperCase();
+  }
+  return out;
+}
+
+function symbolToISO_(sym) {
+  if (!sym) return 'USD';
+  if (sym === '$') return 'USD';
+  if (sym === '£') return 'GBP';
+  if (sym === '€') return 'EUR';
+  return 'USD';
+}
+
+function normalizeName_(n) {
+  let s = String(n || '').trim().toLowerCase();
+  s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  s = s.replace(/[^a-z'-]/g, '');
+  return s;
+}
+function normalizeDateString_(d) {
+  if (!d && d !== 0) return '';
+  if (d instanceof Date) return toYMD_(d);
+  const s = String(d).trim();
+  if (!s) return '';
+  let dt = tryParseDate_(s);
+  if (dt) return toYMD_(dt);
+
+  const mmddyyyy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (mmddyyyy) {
+    let m = +mmddyyyy[1], d2 = +mmddyyyy[2], y = +mmddyyyy[3];
+    if (y < 100) y = (y >= 50 ? 1900 + y : 2000 + y);
+    return pad4_(y) + '-' + pad2_(m) + '-' + pad2_(d2);
+  }
+  const yyyymmdd = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (yyyymmdd) {
+    let y = +yyyymmdd[1], m = +yyyymmdd[2], d2 = +yyyymmdd[3];
+    return pad4_(y) + '-' + pad2_(m) + '-' + pad2_(d2);
+  }
+  dt = new Date(s);
+  if (!isNaN(+dt)) return toYMD_(dt);
+  return '';
+}
+function tryParseDate_(s) { const d = new Date(s); return isNaN(+d) ? null : d; }
+function toYMD_(d) { return d.getFullYear() + '-' + pad2_(d.getMonth() + 1) + '-' + pad2_(d.getDate()); }
+function pad2_(n) { return (n < 10 ? '0' : '') + n; }
+function pad4_(n) { return (n < 10 ? '000' : n < 100 ? '00' : n < 1000 ? '0' : '') + n; }
+
+function isNumber_(v) { return typeof v === 'number' && !isNaN(v); }
+function cmpEq_(a, b) { return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase(); }
+
+function firstNameFuzzyEqual_(a, b) {
+  const x = normalizeName_(a || ''), y = normalizeName_(b || '');
+  if (!x && !y) return false;
+  if (x === y) return true;
+  if (nicknameEqual_(x, y)) return true;
+  return firstNameDistance_(x, y) <= 1;
+}
+function firstNameDistance_(a, b) {
+  const x = normalizeName_(a || ''), y = normalizeName_(b || '');
+  if (!x || !y) return 99;
+  return levenshtein_(x, y);
+}
+function nicknameEqual_(a, b) {
+  const rootA = canonicalNameRoot_(a), rootB = canonicalNameRoot_(b);
+  if (rootA && NICKNAMES[rootA] && (NICKNAMES[rootA].includes(b))) return true;
+  if (rootB && NICKNAMES[rootB] && (NICKNAMES[rootB].includes(a))) return true;
+  if (rootA === rootB && rootA) return true;
+  return false;
+}
+function canonicalNameRoot_(n) {
+  const name = (n || '').toLowerCase();
+  for (const [root, aliases] of Object.entries(NICKNAMES)) {
+    if (root === name) return root;
+    if (aliases.includes(name)) return root;
+  }
+  return null;
+}
+function levenshtein_(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({length: m + 1}, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function columnLetter_(col) {
+  let temp = '', letter = '';
+  while (col > 0) {
+    temp = (col - 1) % 26;
+    letter = String.fromCharCode(temp + 65) + letter;
+    col = (col - temp - 1) / 26;
+  }
+  return letter;
+}
+
+/* =========================
+   Filtering / Utilities
+   ========================= */
+
+function deriveUSReason_(b) {
+  if (!b) return 'FilteredOut';
+  const isUSAddr = detectUS_(b.address).isUS;
+  const isUSD = (b.baseCurrency || '').toUpperCase() === 'USD';
+  if (isUSAddr && isUSD) return { isUS: true, reason: 'Both' };
+  if (isUSAddr) return { isUS: true, reason: 'AddressUS' };
+  if (isUSD) return { isUS: true, reason: 'CurrencyUSD' };
+  return { isUS: false, reason: 'FilteredOut' };
+}
+
+function detectUS_(address) {
+  const s = (address || '').toString().trim();
+  if (!s) return { isUS: false };
+  const low = s.toLowerCase();
+
+  for (const tok of US_TOKENS) if (low.includes(tok)) return { isUS: true };
+  if (/\b\d{5}(-\d{4})?\b/.test(low)) return { isUS: true };
+  for (const name of US_STATE_NAMES) if (low.includes(name)) return { isUS: true };
+  for (const abbr of US_STATE_ABBR) {
+    const re = new RegExp(`(^|[\\s,])${abbr}([\\s,]|$)`, 'i');
+    if (re.test(s)) return { isUS: true };
+  }
+  return { isUS: false };
+}
+
+function isTerminatedInPriorCalendarYear_(g) {
+  const status = normalizeStatusGusto_(g.employmentStatus);
+  const end = g && g.endDate ? g.endDate : '';
+  if (status !== 'Dismissed' || !end) return false;
+  const endDt = tryParseDate_(end);
+  if (!endDt) return false;
+  const currentYear = new Date().getFullYear();
+  const cutoffDt = new Date(currentYear, 0, 1); // Jan 1 current year
+  return endDt < cutoffDt;
+}
+
+function normalizeStatusBob_(s) {
+  if (!s) return '';
+  const low = s.toLowerCase();
+  if (low.includes('employ')) return 'Employed';
+  if (low.includes('terminat')) return 'Terminated';
+  return s;
+}
+function normalizeStatusGusto_(s) {
+  if (!s) return '';
+  const low = s.toLowerCase();
+  if (low.includes('active')) return 'Active';
+  if (low.includes('dismiss')) return 'Dismissed';
+  return s;
+}
+function statusYesNo_(b, g) {
+  if (!b && !g) return 'No';
+  if ((b === 'Employed' && g === 'Active') || (b === 'Terminated' && g === 'Dismissed')) return 'Yes';
+  return 'No';
+}
+
 /* =========================
    Output sheet & formatting
    ========================= */
@@ -557,232 +828,4 @@ function applyFormatting_(ss, header) {
   }
 
   sh.setConditionalFormatRules(rules);
-}
-
-/* =========================
-   Helpers
-   ========================= */
-
-function yn(cond) { return cond ? 'Yes' : 'No'; }
-
-function deriveUSReason_(b) {
-  if (!b) return 'FilteredOut';
-  const isUSAddr = detectUS_(b.address).isUS;
-  const isUSD = (b.baseCurrency || '').toUpperCase() === 'USD';
-  if (isUSAddr && isUSD) return { isUS: true, reason: 'Both' };
-  if (isUSAddr) return { isUS: true, reason: 'AddressUS' };
-  if (isUSD) return { isUS: true, reason: 'CurrencyUSD' };
-  return { isUS: false, reason: 'FilteredOut' };
-}
-
-function detectUS_(address) {
-  const s = (address || '').toString().trim();
-  if (!s) return { isUS: false };
-  const low = s.toLowerCase();
-
-  for (const tok of US_TOKENS) if (low.includes(tok)) return { isUS: true };
-  if (/\b\d{5}(-\d{4})?\b/.test(low)) return { isUS: true };
-  for (const name of US_STATE_NAMES) if (low.includes(name)) return { isUS: true };
-  for (const abbr of US_STATE_ABBR) {
-    const re = new RegExp(`(^|[\\s,])${abbr}([\\s,]|$)`, 'i');
-    if (re.test(s)) return { isUS: true };
-  }
-  return { isUS: false };
-}
-
-function isTerminatedInPriorCalendarYear_(g) {
-  const status = normalizeStatusGusto_(g.employmentStatus);
-  const end = g && g.endDate ? g.endDate : '';
-  if (status !== 'Dismissed' || !end) return false;
-  const currentYear = new Date().getFullYear();
-  const cutoff = `${currentYear}-01-01`;
-  return end < cutoff; // end date before Jan 1 of current year
-}
-
-function normalizeStatusBob_(s) {
-  if (!s) return '';
-  const low = s.toLowerCase();
-  if (low.includes('employ')) return 'Employed';
-  if (low.includes('terminat')) return 'Terminated';
-  return s;
-}
-function normalizeStatusGusto_(s) {
-  if (!s) return '';
-  const low = s.toLowerCase();
-  if (low.includes('active')) return 'Active';
-  if (low.includes('dismiss')) return 'Dismissed';
-  return s;
-}
-function statusYesNo_(b, g) {
-  if (!b && !g) return 'No';
-  if ((b === 'Employed' && g === 'Active') || (b === 'Terminated' && g === 'Dismissed')) return 'Yes';
-  return 'No';
-}
-
-function flsaToType_(flsa) {
-  if (!flsa) return '';
-  const low = String(flsa).toLowerCase();
-  if (low.includes('non') && low.includes('exempt')) return FLSA_TO_GUSTO['non-exempt'];
-  if (low.includes('exempt')) return FLSA_TO_GUSTO['exempt'];
-  return '';
-}
-
-function normalizeGustoType_(t) {
-  if (!t) return '';
-  const low = t.toLowerCase();
-  if (low.includes('no overtime')) return 'Salary/No overtime';
-  if (low.includes('paid by the hour') || low.includes('hour')) return 'Paid by the hour';
-  return t;
-}
-
-function typePeriodConsistent_(type_g, period_g) {
-  const t = (type_g || '').toLowerCase();
-  const p = (period_g || '').toLowerCase();
-  if (!t) return true; // if no type, don't block on consistency here
-  if (t.includes('salary')) return (p === 'year' || p === 'month' || p === '');
-  if (t.includes('hour')) return (p === 'hour' || p === '');
-  return true;
-}
-
-function canCompareAmounts_(type_b, type_g, freq_b, period_g) {
-  const tB = (type_b || '').toLowerCase();
-  const tG = (type_g || '').toLowerCase();
-  const fB = (freq_b || '').toLowerCase();
-  const pG = (period_g || '').toLowerCase();
-
-  // Only compare when units align without conversion.
-  if (tB.includes('salary') && tG.includes('salary')) {
-    if (pG === 'year') return (fB === '' || fB === 'year');   // assume Bob is annual if blank
-    if (pG === 'month') return (fB === 'month');
-    return false;
-  }
-  if (tB.includes('hour') && tG.includes('hour')) {
-    return (pG === 'hour');
-  }
-  return false;
-}
-
-function normalizeFrequency_(f) {
-  if (!f) return '';
-  const low = String(f).toLowerCase().trim();
-  return FREQ_MAP[low] || low;
-}
-
-function parseCompRate_(s) {
-  // "$214,200.00 / year", "$55 / hour"
-  const out = { amount: null, period: null, currency: 'USD' };
-  if (!s) return out;
-  const m = s.match(/([\$£€])?\s*([\d,]+(?:\.\d+)?)\s*\/\s*(year|annual|month|monthly|week|weekly|hour|hourly)/i);
-  if (m) {
-    const symbol = m[1] || '$';
-    const amt = parseFloat(m[2].replace(/,/g, ''));
-    const per = m[3].toLowerCase();
-    out.amount = isNaN(amt) ? null : amt;
-    out.period = FREQ_MAP[per] || per;
-    out.currency = symbolToISO_(symbol);
-  } else {
-    const n = Number(s.replace(/[^\d.-]/g, ''));
-    if (!isNaN(n)) out.amount = n;
-  }
-  return out;
-}
-
-function symbolToISO_(sym) {
-  if (!sym) return 'USD';
-  if (sym === '$') return 'USD';
-  if (sym === '£') return 'GBP';
-  if (sym === '€') return 'EUR';
-  return 'USD';
-}
-
-function normalizeName_(n) {
-  let s = String(n || '').trim().toLowerCase();
-  s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  s = s.replace(/[^a-z'-]/g, '');
-  return s;
-}
-function normalizeDateString_(d) {
-  if (!d && d !== 0) return '';
-  if (d instanceof Date) return toYMD_(d);
-  const s = String(d).trim();
-  if (!s) return '';
-  let dt = tryParseDate_(s);
-  if (dt) return toYMD_(dt);
-
-  const mmddyyyy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-  if (mmddyyyy) {
-    let m = +mmddyyyy[1], d2 = +mmddyyyy[2], y = +mmddyyyy[3];
-    if (y < 100) y = (y >= 50 ? 1900 + y : 2000 + y);
-    return pad4_(y) + '-' + pad2_(m) + '-' + pad2_(d2);
-  }
-  const yyyymmdd = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
-  if (yyyymmdd) {
-    let y = +yyyymmdd[1], m = +yyyymmdd[2], d2 = +yyyymmdd[3];
-    return pad4_(y) + '-' + pad2_(m) + '-' + pad2_(d2);
-  }
-  dt = new Date(s);
-  if (!isNaN(+dt)) return toYMD_(dt);
-  return '';
-}
-function tryParseDate_(s) { const d = new Date(s); return isNaN(+d) ? null : d; }
-function toYMD_(d) { return d.getFullYear() + '-' + pad2_(d.getMonth() + 1) + '-' + pad2_(d.getDate()); }
-function pad2_(n) { return (n < 10 ? '0' : '') + n; }
-function pad4_(n) { return (n < 10 ? '000' : n < 100 ? '00' : n < 1000 ? '0' : '') + n; }
-
-function isNumber_(v) { return typeof v === 'number' && !isNaN(v); }
-function cmpEq_(a, b) { return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase(); }
-
-function firstNameFuzzyEqual_(a, b) {
-  const x = normalizeName_(a || ''), y = normalizeName_(b || '');
-  if (!x && !y) return false;
-  if (x === y) return true;
-  if (nicknameEqual_(x, y)) return true;
-  return firstNameDistance_(x, y) <= 1;
-}
-function firstNameDistance_(a, b) {
-  const x = normalizeName_(a || ''), y = normalizeName_(b || '');
-  if (!x || !y) return 99;
-  return levenshtein_(x, y);
-}
-function nicknameEqual_(a, b) {
-  const rootA = canonicalNameRoot_(a), rootB = canonicalNameRoot_(b);
-  if (rootA && NICKNAMES[rootA] && (NICKNAMES[rootA].includes(b))) return true;
-  if (rootB && NICKNAMES[rootB] && (NICKNAMES[rootB].includes(a))) return true;
-  if (rootA === rootB && rootA) return true;
-  return false;
-}
-function canonicalNameRoot_(n) {
-  const name = n.toLowerCase();
-  for (const [root, aliases] of Object.entries(NICKNAMES)) {
-    if (root === name) return root;
-    if (aliases.includes(name)) return root;
-  }
-  return null;
-}
-function levenshtein_(a, b) {
-  const m = a.length, n = b.length;
-  const dp = Array.from({length: m + 1}, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-function columnLetter_(col) {
-  let temp = '', letter = '';
-  while (col > 0) {
-    temp = (col - 1) % 26;
-    letter = String.fromCharCode(temp + 65) + letter;
-    col = (col - temp - 1) / 26;
-  }
-  return letter;
 }
