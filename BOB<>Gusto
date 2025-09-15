@@ -1,18 +1,3 @@
-/************************************************************
- * HiBob ↔ Gusto Comparison Generator (Yes/No version)
- *
- * Recreated & fixed: single-file Google Apps Script.
- *
- * Key fixes and improvements:
- *  - Sheet-aware header mapping to avoid cross-sheet alias collisions.
- *  - Robust fallback lookups for Bob FLSA and Gusto employee type so Type_Bob
- *    comes from Bob's FLSA and Type_Gusto is populated from Gusto.
- *  - Safer date comparisons (use Date objects).
- *  - More tolerant comp-rate parser (additional 'per' variants and explicit ISO codes).
- *  - Canonical type constants to avoid accidental mismatches by case/whitespace.
- *  - Small readability & defensive checks.
- ************************************************************/
-
 const SHEET_BOB = 'Bob';
 const SHEET_GUSTO = 'Gusto';
 const SHEET_COMPARISON = 'Comparison';
@@ -25,7 +10,7 @@ const HEADER_ALIASES = {
   email: ['email', 'work email address', 'work email', 'employee email', 'company email'],
   firstName: ['first name', 'firstname', 'first', 'f'],
   lastName: ['last name', 'lastname', 'last', 'l', 'last name)'],
-  dob: ['date of birth', 'dob', 'birth date'],
+  dob: ['date of birth', 'dob', 'birth date', 'birthdate'],
 
   // address
   address: ['full address', 'address', 'street address', 'home address', 'home street address'],
@@ -36,14 +21,13 @@ const HEADER_ALIASES = {
   flsaCode: ['flsa code', 'flsa', 'flsa status', 'flsa_code'],
   baseSalary: ['base salary', 'salary', 'base pay', 'annual base salary'],
   baseCurrency: ['base salary currency', 'currency', 'salary currency', 'currency code'],
-  payFrequency: ['salary pay frequency', 'salary pay period', 'pay frequency', 'pay period'],
   effDate: ['base salary/effective date', 'base salary effective date', 'effective date'],
 
   // gusto
   employmentStatus: ['employment status', 'status', 'employee status'],
-  employeeType: ['employee type', 'job compensation type', 'employee_type'],
-  endDate: ['employee end date', 'end date'],
-  compRateString: ['job compensation rate', 'compensation rate', 'rate', 'comp rate'],
+  employeeType: ['employee type', 'employment type', 'job compensation type', 'compensation type', 'pay type', 'employee_type'],
+  endDate: ['employee end date', 'end date', 'termination date'],
+  compRateString: ['job compensation rate', 'compensation rate', 'rate', 'comp rate', 'pay rate'],
   compEffectiveDate: ['job compensation effective date', 'compensation effective date', 'comp effective date']
 };
 
@@ -51,6 +35,22 @@ const FLSA_TO_GUSTO = {
   'exempt': TYPE_SALARY,
   'non-exempt': TYPE_HOURLY
 };
+
+// U.S. detection helpers
+
+function isGustoEmployed_(g) {
+  if (!g) return false;
+  const status = normalizeStatusGusto_(g.employmentStatus || '');
+  if (status === 'Active') return true;
+
+  // Fall back to employee type signals
+  const t = String(g.employeeType || g.employee_type || '').toLowerCase();
+  return (
+    /\bfull[\s-]?time\b/.test(t) ||
+    /\bseasonal\b/.test(t) ||
+    /\bpart\s*[- ]?time\s*eligible\b/.test(t)
+  );
+}
 
 const US_TOKENS = ['united states', 'usa', 'u.s.', 'us', 'united states of america'];
 const US_STATE_ABBR = [
@@ -68,40 +68,12 @@ const US_STATE_NAMES = [
   'wisconsin','wyoming','district of columbia'
 ];
 
-const NICKNAMES = {
-  'alexander': ['alex', 'xander', 'sasha'],
-  'andrew': ['andy', 'drew'],
-  'anthony': ['tony'],
-  'benjamin': ['ben', 'benny'],
-  'catherine': ['cathy', 'cath', 'cate', 'kate', 'katie', 'kat'],
-  'charles': ['charlie', 'chuck'],
-  'christopher': ['chris', 'kit'],
-  'daniel': ['dan', 'danny'],
-  'elizabeth': ['liz', 'lizzy', 'beth', 'betty', 'elle', 'ellie', 'liza'],
-  'jacob': ['jake'],
-  'james': ['jim', 'jimmy', 'jamie'],
-  'jennifer': ['jen', 'jenny'],
-  'jonathan': ['jon', 'john'],
-  'john': ['jon', 'johnny', 'jack'],
-  'katherine': ['kate', 'katie', 'kat', 'kathy', 'cathy'],
-  'margaret': ['meg', 'maggie', 'peggy'],
-  'matthew': ['matt'],
-  'michael': ['mike', 'mikey'],
-  'nicholas': ['nick', 'nicky'],
-  'patricia': ['pat', 'trish', 'tricia', 'patti'],
-  'richard': ['rick', 'ricky', 'rich', 'dick'],
-  'robert': ['rob', 'bob', 'bobby', 'robby'],
-  'stephen': ['steve', 'steven'],
-  'steven': ['steve', 'stephen'],
-  'thomas': ['tom', 'tommy'],
-  'william': ['will', 'bill', 'billy', 'liam']
-};
-
+// frequency map used only for parsing Gusto comp period text
 const FREQ_MAP = {
   'annual': 'year', 'annually': 'year', 'yearly': 'year', 'year': 'year',
-  'monthly': 'month', 'month': 'month',
-  'weekly': 'week', 'week': 'week',
-  'hourly': 'hour', 'hour': 'hour'
+  'month': 'month', 'monthly': 'month',
+  'week': 'week', 'weekly': 'week',
+  'hour': 'hour', 'hourly': 'hour'
 };
 
 function onOpen() {
@@ -162,35 +134,30 @@ function readSheetRecords_(ss, sheetName) {
   return { headers: rawHeaders, records };
 }
 
-/**
- * buildHeaderMap_ - map raw header strings to canonical keys, with sheet-scoped filtering
- */
+/** Map raw header strings to canonical keys, with sheet-scoped filtering */
 function buildHeaderMap_(headers, sheetName) {
   const lower = headers.map(h => h.toString().trim().toLowerCase());
   const map = new Array(headers.length).fill(null);
 
-  // keys that are Bob-specific vs Gusto-specific; shared keys are handled too.
-  const bobKeys = new Set(['lifecycleStatus','lastDayOfWork','flsaCode','baseSalary','baseCurrency','payFrequency','effDate']);
+  const bobKeys = new Set(['lifecycleStatus','lastDayOfWork','flsaCode','baseSalary','baseCurrency','effDate']);
   const gustoKeys = new Set(['employmentStatus','employeeType','endDate','compRateString','compEffectiveDate']);
   const sharedKeys = new Set(['email','firstName','lastName','dob','address']);
 
   for (let c = 0; c < lower.length; c++) {
     const h = lower[c];
     for (const [canon, aliases] of Object.entries(HEADER_ALIASES)) {
-      // restrict candidates based on sheet
       if (sheetName === SHEET_BOB && !(bobKeys.has(canon) || sharedKeys.has(canon))) continue;
       if (sheetName === SHEET_GUSTO && !(gustoKeys.has(canon) || sharedKeys.has(canon))) continue;
-      // allow mapping if alias matches
+
       if (aliases.some(a => h === a)) { map[c] = canon; break; }
       const hLoose = h.replace(/[()]/g, '').trim();
       if (!map[c] && aliases.some(a => hLoose === a)) { map[c] = canon; break; }
     }
 
-    // generic fallbacks (if still unmapped)
+    // generic fallbacks
     if (!map[c]) {
       if (h === 'status') map[c] = 'employmentStatus';
       if (h === 'currency code') map[c] = 'baseCurrency';
-      // allow "employee type" on Bob sheets only if explicitly present in alias list
     }
   }
   return map;
@@ -205,14 +172,12 @@ function normalizeRecord_(obj) {
   if (out.lastName) out.lastName = normalizeName_(out.lastName);
 
   if (out.dob) out.dob = normalizeDateString_(out.dob);
-function yn(cond) { return cond ? 'Yes' : 'No'; }
 
   if (out.baseCurrency) out.baseCurrency = String(out.baseCurrency).trim().toUpperCase().replace(/[^A-Z]/g, '');
-  if (out.payFrequency) out.payFrequency = normalizeFrequency_(out.payFrequency);
 
   if (out.effDate) out.effDate = normalizeDateString_(out.effDate);
   if (out.compEffectiveDate) {
-    // Split only on range separator with surrounding spaces or long dashes, not on date hyphens
+    // Split only on a spaced dash range separator, not on date hyphens
     const start = String(out.compEffectiveDate).split(/\s[-–—]\s/)[0].trim();
     out.compEffectiveDate = normalizeDateString_(start);
   }
@@ -257,7 +222,7 @@ function computeMatchesAndComparisons_(bobRecords, gustoRecords) {
     return false;
   });
 
-  // 2) Index Gusto (filtered)
+  // 2) Index Gusto
   const gustoByEmail = new Map();
   const gustoBuckets = new Map(); // last|dob → [records]
   for (const g of gustoCurrent) {
@@ -271,25 +236,28 @@ function computeMatchesAndComparisons_(bobRecords, gustoRecords) {
     }
   }
 
-  const matchedGusto = new Set();
-  const rows = [];
+  const matchedTriples = []; // collect rows with gusto key for duplicate detection
 
   // 3) Match each Bob row to Gusto
   for (const b of bobFiltered) {
-    let g = null, matchMethod = '', matchScore = 0;
-    let ambiguity = false, needsReview = false;
+    let g = null;
+    let matchMethod = '';
+    let matchScore = 0;
+    let ambiguity = false;
+    let needsReview = false;
 
     // 3.1) email exact
     if (b.email && gustoByEmail.has(b.email)) {
       g = gustoByEmail.get(b.email);
-      matchedGusto.add(g);
       matchMethod = 'Email';
       matchScore += 70;
-      if (b.dob && g.dob && b.dob === g.dob) matchScore += 40;
-      else if (b.firstName && g.firstName && firstNameFuzzyEqual_(b.firstName, g.firstName) && b.lastName && g.lastName && b.lastName === g.lastName) matchScore += 30;
+      // Build score add-ons per spec
+      if (b.lastName && g.lastName && b.lastName === g.lastName && b.dob && g.dob && b.dob === g.dob) matchScore += 40;
+      if (firstNameFuzzyEqual_(b.firstName, g.firstName)) matchScore += 40;
+      matchScore = Math.min(100, matchScore);
     }
 
-    // 3.2) fallback: last exact + DOB exact + first fuzzy
+    // 3.2) fallback: last exact + DOB exact + first fuzzy (or needs review if fuzzy fails)
     if (!g) {
       const last = (b.lastName || '').toLowerCase();
       const dob = b.dob || '';
@@ -300,16 +268,15 @@ function computeMatchesAndComparisons_(bobRecords, gustoRecords) {
           const cand = candidates[0];
           if (firstNameFuzzyEqual_(b.firstName, cand.firstName)) {
             g = cand;
-            matchedGusto.add(g);
             matchMethod = 'Name+DOB';
-            matchScore = 80;
+            matchScore = 70 + 40 + 40; // email not used, but spec scoring still applies
           } else {
             g = cand;
-            matchedGusto.add(g);
             matchMethod = 'Name+DOB';
-            matchScore = 80;
+            matchScore = 70 + 40; // last+dob strong; first name failed fuzzy
             needsReview = true;
           }
+          matchScore = Math.min(100, matchScore);
         } else if (candidates.length > 1) {
           let best = null, bestDist = 999, tie = false;
           for (const cand of candidates) {
@@ -319,27 +286,31 @@ function computeMatchesAndComparisons_(bobRecords, gustoRecords) {
           }
           if (!tie && best && bestDist <= 1) {
             g = best;
-            matchedGusto.add(g);
             matchMethod = 'Name+DOB';
-            matchScore = 80;
+            matchScore = 70 + 40 + 40;
           } else {
             ambiguity = true;
             matchMethod = 'Ambiguous';
+            matchScore = 79; // force <80 for ambiguous per spec
           }
         }
       }
     }
 
     const usReason = deriveUSReason_(b);
-    const comparison = comparePairYesNo_(b, g, { matchMethod, matchScore, ambiguity, needsReview, usReason });
-    rows.push(comparison);
+    const row = comparePairYesNo_(b, g, { matchMethod, matchScore, ambiguity, needsReview, usReason });
+
+    // Keep gusto key for duplicate detection (email preferred, else last|dob)
+    const gKey = g ? (g.email || ((g.lastName && g.dob) ? `${g.lastName}|${g.dob}` : '')) : '';
+    matchedTriples.push({ row, gKey, method: matchMethod });
   }
 
   // 4) Surface Gusto-only rows that remain (after termination filter)
+  const matchedGustoKeys = new Set(matchedTriples.filter(t => t.gKey).map(t => t.gKey));
   for (const g of gustoCurrent) {
-    if (matchedGusto.has(g)) continue;
+    const gKey = g.email || ((g.lastName && g.dob) ? `${g.lastName}|${g.dob}` : '');
+    if (matchedGustoKeys.has(gKey)) continue;
 
-    // US reason for Gusto-only: address and currency (assume USD if not parsed)
     const addrUS = detectUS_(g.address).isUS;
     const isUSD = (g.compCurrency || 'USD') === 'USD';
     const usReason = (addrUS && isUSD) ? 'Both' : (addrUS ? 'AddressUS' : (isUSD ? 'CurrencyUSD' : 'FilteredOut'));
@@ -351,16 +322,40 @@ function computeMatchesAndComparisons_(bobRecords, gustoRecords) {
       needsReview: true,
       usReason
     };
-    rows.push(comparePairYesNo_(null, g, meta));
+    const row = comparePairYesNo_(null, g, meta);
+    matchedTriples.push({ row, gKey, method: meta.matchMethod });
   }
 
+  // 5) Duplicate target detection: if multiple rows point at same Gusto key → Ambiguous
+  const byKey = new Map();
+  for (const t of matchedTriples) {
+    if (!t.gKey) continue;
+    if (!byKey.has(t.gKey)) byKey.set(t.gKey, []);
+    byKey.get(t.gKey).push(t);
+  }
+  for (const group of byKey.values()) {
+    if (group.length > 1) {
+      for (const t of group) {
+        if (t.row.Match_Method === 'Email' || t.row.Match_Method === 'Name+DOB') {
+          t.row.Review_Flag = 'Ambiguous';
+          t.row.Match_Method = 'Ambiguous';
+          t.row.Match_Score = Math.min(t.row.Match_Score || 0, 79);
+        }
+      }
+    }
+  }
+
+  // 6) Sort by score descending
+  matchedTriples.sort((a, b) => (b.row.Match_Score || 0) - (a.row.Match_Score || 0));
+
   const header = buildOutputHeaderYesNo_();
-  rows.sort((a, b) => (b.Match_Score || 0) - (a.Match_Score || 0));
+  const rows = matchedTriples.map(t => t.row);
   return { header, rows };
 }
 
 /**
- * YES/NO comparison row assembly.
+ * Assemble a single YES/NO comparison row.
+ * NOTE: Compensation now shows FLSA_Bob vs Type_Gusto (mapped) per spec.
  */
 function comparePairYesNo_(b, g, meta) {
   const email_b = b ? (b.email || '') : '';
@@ -374,29 +369,32 @@ function comparePairYesNo_(b, g, meta) {
 
   const status_b = b ? normalizeStatusBob_(b.lifecycleStatus) : '';
   const status_g = g ? normalizeStatusGusto_(g.employmentStatus) : '';
+  const gustoEmployedLike = g ? isGustoEmployed_(g) : false;
   const term_b = b ? (b.lastDayOfWork || '') : '';
   const term_g = g ? (g.endDate || '') : '';
 
-  // Robust Bob FLSA lookup (accept many incoming header variants)
+  // Bob FLSA (raw → Exempt / Non-Exempt)
   const rawFlsaBob = b ? (b.flsaCode || b.flsa || b.flsa_status || b.flsa_code || '') : '';
   const flsa_b = rawFlsaBob ? normalizeFLSA_(rawFlsaBob) : ''; // "Exempt" | "Non-Exempt" | ""
-  const type_b = flsa_b ? flsaToType_(flsa_b) : '';    // mapped: TYPE_SALARY | TYPE_HOURLY | ""
 
-  // Robust Gusto type lookup
-  const rawGustoType = g ? (g.employeeType || g.employee_type || g['job compensation type'] || g.jobCompensationType || '') : '';
+  // Map Bob FLSA → conceptual type (for matching only)
+  const type_from_bob = flsaToType_(flsa_b); // TYPE_SALARY | TYPE_HOURLY | ""
+
+  // Gusto type (normalized)
+  const rawGustoType = g ? (g.employeeType || g.employee_type || g['job compensation type'] || g['compensation type'] || g['pay type'] || g.jobCompensationType || '') : '';
   const type_g = rawGustoType ? normalizeGustoType_(rawGustoType) : '';
 
   const amt_b = b ? (isNumber_(b.baseSalary) ? b.baseSalary : null) : null;
   const amt_g = g ? (isNumber_(g.compAmount) ? g.compAmount : null) : null;
 
-  const freq_b = b ? (b.payFrequency || '') : '';
+  // We no longer use Bob pay frequency; only sanity-check Gusto period
   const period_g = g ? (g.compPeriod || '') : '';
 
   const eff_b = b ? (b.effDate || '') : '';
   const eff_g = g ? (g.compEffectiveDate || '') : '';
 
   const notes = [];
-  const review = meta.ambiguity ? 'Ambiguous' : (meta.needsReview ? 'Needs review' : '');
+  let review = meta.ambiguity ? 'Ambiguous' : (meta.needsReview ? 'Needs review' : '');
 
   // Identity YES/NO
   const Email_Match = yn(email_b && email_g && cmpEq_(email_b, email_g));
@@ -409,39 +407,52 @@ function comparePairYesNo_(b, g, meta) {
   if (Last_Match  === 'No') notes.push('Last name mismatch');
   if (DOB_Match   === 'No') notes.push('DOB mismatch');
 
-  // Status YES/NO (Employed↔Active, Terminated↔Dismissed)
-  const Status_Match = statusYesNo_(status_b, status_g);
-  if (Status_Match === 'No') notes.push(`Status differs: Bob=${status_b||'blank'} vs Gusto=${status_g||'blank'}`);
+  // Status YES/NO with extended mapping
+let Status_Match;
+if (status_b === 'Employed') {
+  Status_Match = yn(gustoEmployedLike); // Active OR (Full Time | Seasonal | Part time eligible)
+} else if (status_b === 'Terminated') {
+  Status_Match = yn(status_g === 'Dismissed');
+} else {
+  // Fallback strict equality
+  Status_Match = yn(status_b && status_g && status_b === status_g);
+}
+if (Status_Match === 'No') {
+  const typeHint = g && (g.employeeType || g.employee_type) ? `; Gusto type=${g.employeeType || g.employee_type}` : '';
+  notes.push(`Status differs: Bob=${status_b||'blank'} vs Gusto=${status_g||'blank'}${typeHint}`);
+}
+
 
   // Term date YES if both blank OR equal; else NO
   const TermDate_Match = yn((!term_b && !term_g) || (term_b && term_g && term_b === term_g));
   if (TermDate_Match === 'No') notes.push(`Termination date mismatch: Bob=${term_b||'blank'} vs Gusto=${term_g||'blank'}`);
 
-  // Type YES/NO: Bob mapped type ↔ Gusto type AND Gusto period consistent
+  // Type YES/NO: Bob FLSA→Type vs Gusto Type, plus Gusto period sanity
   const typePeriodOK = typePeriodConsistent_(type_g, period_g);
   if (type_g && !typePeriodOK) notes.push(`Type vs rate period inconsistent: ${type_g} with period=${period_g || 'blank'}`);
 
-  const Type_Match = yn(type_b && type_g && type_b === type_g && typePeriodOK);
+  const Type_Match = yn(type_from_bob && type_g && type_from_bob === type_g && typePeriodOK);
   if (Type_Match === 'No') {
-    notes.push(`Type mismatch: Bob=${type_b||'blank'} vs Gusto=${type_g||'blank'}`);
+    notes.push(`Type mismatch: Bob=${type_from_bob||'blank'} vs Gusto=${type_g||'blank'}`);
   }
 
-  // Amount YES/NO: compare only when comparable
-  const amountComparable = canCompareAmounts_(type_b, type_g, freq_b, period_g);
+  // Amount YES/NO: only when units align without conversion, and Gusto period is sane.
+  // We no longer consider Bob frequency at all.
+  const amountComparable = canCompareAmounts_(type_from_bob, type_g, period_g);
   let Amount_Match = 'No';
   if (!isNumber_(amt_b) || !isNumber_(amt_g)) {
     Amount_Match = 'No';
     notes.push(`Missing amount: Bob=${isNumber_(amt_b)?amt_b:'blank'}, Gusto=${isNumber_(amt_g)?amt_g:'blank'}`);
   } else if (!amountComparable) {
     Amount_Match = 'No';
-    notes.push(`Cannot compare amounts due to unit/period: BobFreq=${freq_b||'blank'}, GustoPeriod=${period_g||'blank'}`);
+    notes.push(`Cannot compare amounts due to unit/period: GustoPeriod=${period_g||'blank'}`);
   } else {
     const equal = Math.abs(amt_b - amt_g) < 0.01;
     Amount_Match = yn(equal);
     if (!equal) notes.push(`Amount differs: Bob=${amt_b} vs Gusto=${amt_g}`);
   }
 
-  // Currency mismatch note (informational)
+  // Currency mismatch note (informational only)
   const cur_b = (b && b.baseCurrency) ? b.baseCurrency : '';
   const cur_g = (g && g.compCurrency) ? g.compCurrency : 'USD';
   if (cur_b && cur_g && cur_b !== cur_g) notes.push(`Currency mismatch: Bob=${cur_b} vs Gusto=${cur_g}`);
@@ -450,19 +461,26 @@ function comparePairYesNo_(b, g, meta) {
   const EffDate_Match = yn(eff_b && eff_g && eff_b === eff_g);
   if (EffDate_Match === 'No') notes.push(`Effective date mismatch: Bob=${eff_b||'blank'} vs Gusto=${eff_g||'blank'}`);
 
-  // Score
-  let score = meta.matchScore || 0;
-  if (Email_Match === 'Yes') score = Math.max(score, 70);
-  if (DOB_Match === 'Yes') score = Math.min(100, score + 40);
-  if (First_Match === 'Yes' && Last_Match === 'Yes' && score < 70) score += 40;
+  // Score per spec
+  let score = 0;
+  if (email_b && email_g && cmpEq_(email_b, email_g)) score += 70;
+  if (last_b && last_g && last_b === last_g && dob_b && dob_g && dob_b === dob_g) score += 40;
+  if (First_Match === 'Yes') score += 40;
+  score = Math.min(100, score);
   if (meta.ambiguity) score = Math.min(score, 79);
+  if (score >= 60 && score <= 79 && meta.matchMethod !== 'Email') {
+    review = review || 'Needs review';
+  }
+  if (score < 60 && (meta.matchMethod === 'Name+DOB' || meta.matchMethod === 'Ambiguous')) {
+    // keep whatever review flag was set; spec treats <60 as "No match"
+  }
 
   const usReason = meta.usReason || deriveUSReason_(b);
 
   return {
     Match_Key: email_b || (last_b && dob_b ? `${last_b}|${dob_b}` : ''),
     Match_Method: meta.matchMethod || (b && g ? 'Heuristic' : 'No match'),
-    Review_Flag: review,
+    Review_Flag: review || '',
     Match_Score: score,
     US_Filter_Reason: usReason.reason || usReason,
 
@@ -474,7 +492,9 @@ function comparePairYesNo_(b, g, meta) {
     Status_Bob: status_b, Status_Gusto: status_g, Status_Match,
     TermDate_Bob: term_b, EndDate_Gusto: term_g, TermDate_Match,
 
-    Type_Bob: type_b, Type_Gusto: type_g, Type_Match,
+    // Compensation per spec
+    FLSA_Bob: flsa_b, Type_Gusto: type_g, Type_Match,
+
     Amount_Bob: isNumber_(amt_b) ? amt_b : '', Amount_Gusto: isNumber_(amt_g) ? amt_g : '', Amount_Match,
 
     EffDate_Bob: eff_b, EffDate_Gusto: eff_g, EffDate_Match,
@@ -482,6 +502,10 @@ function comparePairYesNo_(b, g, meta) {
     Notes: notes.join(' | ')
   };
 }
+
+/* =========================
+   Normalizers & helpers
+   ========================= */
 
 function normalizeFLSA_(s) {
   if (!s) return '';
@@ -504,32 +528,31 @@ function normalizeGustoType_(t) {
   const low = String(t).toLowerCase();
   if (low.includes('no overtime')) return TYPE_SALARY;
   if (low.includes('paid by the hour') || low.includes('hour')) return TYPE_HOURLY;
-  // fallback: try to map common words
+  // fallback: common words
   if (low.includes('salary') && !low.includes('hour')) return TYPE_SALARY;
   if (low.includes('hour') && !low.includes('salary')) return TYPE_HOURLY;
-  return String(t).trim(); // keep trimmed original as last resort
+  return String(t).trim();
 }
 
 function typePeriodConsistent_(type_g, period_g) {
   const t = (type_g || '').toLowerCase();
   const p = (period_g || '').toLowerCase();
-  if (!t) return true; // if no type, don't block on consistency here
+  if (!t) return true; // if no type, don't block here
   if (t.includes('salary')) return (p === 'year' || p === 'month' || p === '');
   if (t.includes('hour')) return (p === 'hour' || p === '');
   return true;
 }
 
-function canCompareAmounts_(type_b, type_g, freq_b, period_g) {
-  const tB = (type_b || '').toLowerCase();
+// Only allow comparison when units align and Gusto period is sane. Bob freq is ignored.
+function canCompareAmounts_(type_b_mapped, type_g, period_g) {
+  const tB = (type_b_mapped || '').toLowerCase();
   const tG = (type_g || '').toLowerCase();
-  const fB = (freq_b || '').toLowerCase();
   const pG = (period_g || '').toLowerCase();
 
-  // Only compare when units align without conversion.
+  if (!tB || !tG) return false;
+
   if (tB.includes('salary') && tG.includes('salary')) {
-    if (pG === 'year') return (fB === '' || fB === 'year');   // assume Bob is annual if blank
-    if (pG === 'month') return (fB === 'month');
-    return false;
+    return (pG === 'year' || pG === 'month'); // OK to compare numbers; no conversion attempted
   }
   if (tB.includes('hour') && tG.includes('hour')) {
     return (pG === 'hour');
@@ -537,20 +560,12 @@ function canCompareAmounts_(type_b, type_g, freq_b, period_g) {
   return false;
 }
 
-function normalizeFrequency_(f) {
-  if (!f) return '';
-  const low = String(f).toLowerCase().trim();
-  return FREQ_MAP[low] || low;
-}
-
 function parseCompRate_(s) {
-  // Handles many common forms:
-  // "$214,200.00 / year", "$55 / hour", "£30 per hour", "214200 per year USD", "55pa"
+  // Examples: "$214,200.00 / year", "$55 / hour", "£30 per hour", "214200 per year USD", "55pa"
   const out = { amount: null, period: null, currency: 'USD' };
   if (!s) return out;
   const str = String(s).trim();
 
-  // try to match with symbols and many "per" variants
   const m = str.match(/([\$£€])?\s*([\d,]+(?:\.\d+)?)\s*(?:\/|\bper\b|\bat\b|\bpa\b|\bp\.a\.?\b)\s*(year|annual|annum|month|monthly|week|weekly|hour|hourly)/i);
   if (m) {
     const symbol = m[1] || '$';
@@ -560,7 +575,6 @@ function parseCompRate_(s) {
     out.period = FREQ_MAP[per] || per;
     out.currency = symbolToISO_(symbol);
   } else {
-    // try to find numeric and a period word somewhere
     const mm = str.match(/([\d,]+(?:\.\d+)?)/);
     if (mm) {
       const amt = parseFloat(mm[1].replace(/,/g, ''));
@@ -621,30 +635,14 @@ function cmpEq_(a, b) { return String(a || '').trim().toLowerCase() === String(b
 
 function firstNameFuzzyEqual_(a, b) {
   const x = normalizeName_(a || ''), y = normalizeName_(b || '');
-  if (!x && !y) return false;
+  if (!x || !y) return false;
   if (x === y) return true;
-  if (nicknameEqual_(x, y)) return true;
-  return firstNameDistance_(x, y) <= 1;
+  return firstNameDistance_(x, y) <= 1; // No nickname logic
 }
 function firstNameDistance_(a, b) {
   const x = normalizeName_(a || ''), y = normalizeName_(b || '');
   if (!x || !y) return 99;
   return levenshtein_(x, y);
-}
-function nicknameEqual_(a, b) {
-  const rootA = canonicalNameRoot_(a), rootB = canonicalNameRoot_(b);
-  if (rootA && NICKNAMES[rootA] && (NICKNAMES[rootA].includes(b))) return true;
-  if (rootB && NICKNAMES[rootB] && (NICKNAMES[rootB].includes(a))) return true;
-  if (rootA === rootB && rootA) return true;
-  return false;
-}
-function canonicalNameRoot_(n) {
-  const name = (n || '').toLowerCase();
-  for (const [root, aliases] of Object.entries(NICKNAMES)) {
-    if (root === name) return root;
-    if (aliases.includes(name)) return root;
-  }
-  return null;
 }
 function levenshtein_(a, b) {
   const m = a.length, n = b.length;
@@ -675,8 +673,10 @@ function columnLetter_(col) {
 }
 
 /* =========================
-   Filtering / Utilities
+   Helpers & Filtering / Utilities
    ========================= */
+
+function yn(cond) { return cond ? 'Yes' : 'No'; }
 
 function deriveUSReason_(b) {
   if (!b) return 'FilteredOut';
@@ -750,7 +750,9 @@ function buildOutputHeaderYesNo_() {
     'Status_Bob','Status_Gusto','Status_Match',
     'TermDate_Bob','EndDate_Gusto','TermDate_Match',
 
-    'Type_Bob','Type_Gusto','Type_Match',
+    // Compensation per spec
+    'FLSA_Bob','Type_Gusto','Type_Match',
+   
     'Amount_Bob','Amount_Gusto','Amount_Match',
 
     'EffDate_Bob','EffDate_Gusto','EffDate_Match',
@@ -791,14 +793,14 @@ function applyFormatting_(ss, header) {
     ['DOB_Bob','DOB_Gusto','DOB_Match'],
     ['Status_Bob','Status_Gusto','Status_Match'],
     ['TermDate_Bob','EndDate_Gusto','TermDate_Match'],
-    ['Type_Bob','Type_Gusto','Type_Match'],
+    ['FLSA_Bob','Type_Gusto','Type_Match'],
     ['Amount_Bob','Amount_Gusto','Amount_Match'],
     ['EffDate_Bob','EffDate_Gusto','EffDate_Match']
   ];
 
   const rules = [];
 
-  // Red for No
+  // Red for No on any comparison pair block
   for (const [bobCol, gusCol, matchCol] of PAIRS) {
     const bCol = colIndex[bobCol], gCol = colIndex[gusCol], mCol = colIndex[matchCol];
     if (!bCol || !gCol || !mCol) continue;
@@ -809,12 +811,12 @@ function applyFormatting_(ss, header) {
       SpreadsheetApp.newConditionalFormatRule()
         .setRanges([range])
         .whenFormulaSatisfied(formulaNo)
-        .setBackground('#f4c7c3')
+        .setBackground('#f4c7c3') // light red
         .build()
     );
   }
 
-  // Amber entire row if Review_Flag indicates review/ambiguous
+  // Amber entire row if review/ambiguous
   const rfCol = colIndex['Review_Flag'];
   if (rfCol) {
     const rowRange = sh.getRange(2, 1, rows - 1, cols);
@@ -823,10 +825,25 @@ function applyFormatting_(ss, header) {
       SpreadsheetApp.newConditionalFormatRule()
         .setRanges([rowRange])
         .whenFormulaSatisfied(formulaAmber)
-        .setBackground('#fce8b2')
+        .setBackground('#fce8b2') // amber
+        .build()
+    );
+  }
+
+  // Light gray shade if Match_Score < 60 or FilteredOut
+  const scoreCol = colIndex['Match_Score'], usCol = colIndex['US_Filter_Reason'];
+  if (scoreCol && usCol) {
+    const rowRange2 = sh.getRange(2, 1, rows - 1, cols);
+    const formulaGray = `=OR($${columnLetter_(scoreCol)}2<60,$${columnLetter_(usCol)}2="FilteredOut")`;
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([rowRange2])
+        .whenFormulaSatisfied(formulaGray)
+        .setBackground('#eeeeee') // light gray
         .build()
     );
   }
 
   sh.setConditionalFormatRules(rules);
 }
+
