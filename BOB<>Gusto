@@ -474,7 +474,7 @@ function comparePairYesNo_(b, g, meta) {
     Status_Bob: status_b, Status_Gusto: status_g, Status_Match,
     TermDate_Bob: term_b, EndDate_Gusto: term_g, TermDate_Match,
 
-    Type_Bob: type_b, Type_Gusto: type_g, Type_Match,
+    Type_Bob: type_g, Type_Gusto: type_g, Type_Match,
     Amount_Bob: isNumber_(amt_b) ? amt_b : '', Amount_Gusto: isNumber_(amt_g) ? amt_g : '', Amount_Match,
 
     EffDate_Bob: eff_b, EffDate_Gusto: eff_g, EffDate_Match,
