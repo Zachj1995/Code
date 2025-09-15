@@ -205,6 +205,7 @@ function normalizeRecord_(obj) {
   if (out.lastName) out.lastName = normalizeName_(out.lastName);
 
   if (out.dob) out.dob = normalizeDateString_(out.dob);
+function yn(cond) { return cond ? 'Yes' : 'No'; }
 
   if (out.baseCurrency) out.baseCurrency = String(out.baseCurrency).trim().toUpperCase().replace(/[^A-Z]/g, '');
   if (out.payFrequency) out.payFrequency = normalizeFrequency_(out.payFrequency);
